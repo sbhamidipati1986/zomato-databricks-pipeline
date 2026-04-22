@@ -1,0 +1,134 @@
+{
+  "name": "Zomato Analytics — Full Medallion Pipeline",
+  "description": "End-to-end pipeline: DDL → Data Gen → Bronze → Silver → Gold → Dashboard",
+  "tags": {
+    "project": "zomato-analytics",
+    "team": "data-engineering",
+    "architecture": "medallion"
+  },
+  "tasks": [
+    {
+      "task_key": "create_tables",
+      "description": "Create Unity Catalog, schemas, volumes, and all Delta tables (idempotent DDL)",
+      "notebook_task": {
+        "notebook_path": "/Workspace/Zomato-Analytics/setup/00_create_tables",
+        "base_parameters": {
+          "catalog_name": "zomato_analytics"
+        }
+      },
+      "timeout_seconds": 300,
+      "max_retries": 1
+    },
+    {
+      "task_key": "generate_data",
+      "description": "Generate synthetic data using Faker and write Parquet to landing volume",
+      "depends_on": [
+        { "task_key": "create_tables" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Zomato-Analytics/setup/01_generate_data",
+        "base_parameters": {
+          "catalog_name": "zomato_analytics"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    },
+    {
+      "task_key": "bronze_ingestion",
+      "description": "Ingest raw data into Bronze layer with schema enforcement and audit columns",
+      "depends_on": [
+        { "task_key": "generate_data" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Zomato-Analytics/bronze/01_bronze_ingestion",
+        "base_parameters": {
+          "catalog_name": "zomato_analytics",
+          "env": "dev",
+          "source_path": "/Volumes/zomato_analytics/raw/landing",
+          "load_type": "full"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 2,
+      "min_retry_interval_millis": 60000
+    },
+    {
+      "task_key": "dq_checks",
+      "description": "Run rule-based data quality checks on Bronze tables — split records into validated and quarantine Delta tables; block pipeline if pass rate < 90%",
+      "depends_on": [
+        { "task_key": "bronze_ingestion" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Zomato-Analytics/quality/07_dq_checks",
+        "base_parameters": {
+          "catalog_name": "zomato_analytics",
+          "env": "dev",
+          "dq_threshold_pct": "90.0"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 0
+    },
+    {
+      "task_key": "silver_transformation",
+      "description": "Cleanse, deduplicate, and transform Bronze data into Silver layer",
+      "depends_on": [
+        { "task_key": "dq_checks" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Zomato-Analytics/silver/02_silver_transformation",
+        "base_parameters": {
+          "catalog_name": "zomato_analytics",
+          "env": "dev"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "gold_aggregation",
+      "description": "Build business aggregations, dimensions, and fact tables in Gold layer",
+      "depends_on": [
+        { "task_key": "silver_transformation" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Zomato-Analytics/gold/03_gold_aggregation",
+        "base_parameters": {
+          "catalog_name": "zomato_analytics",
+          "env": "dev"
+        }
+      },
+      "timeout_seconds": 3600,
+      "max_retries": 1
+    },
+    {
+      "task_key": "dashboard_refresh",
+      "description": "Refresh executive analytics dashboard with latest Gold data",
+      "depends_on": [
+        { "task_key": "gold_aggregation" }
+      ],
+      "notebook_task": {
+        "notebook_path": "/Workspace/Zomato-Analytics/dashboard/04_analytics_dashboard",
+        "base_parameters": {
+          "catalog_name": "zomato_analytics"
+        }
+      },
+      "timeout_seconds": 1800,
+      "max_retries": 1
+    }
+  ],
+  "schedule": {
+    "quartz_cron_expression": "0 0 2 * * ?",
+    "timezone_id": "Asia/Kolkata",
+    "pause_status": "PAUSED"
+  },
+  "email_notifications": {
+    "on_start": [],
+    "on_success": ["dataarchitectstudio@gmail.com"],
+    "on_failure": ["dataarchitectstudio@gmail.com"],
+    "no_alert_for_skipped_runs": true
+  },
+  "max_concurrent_runs": 1,
+  "format": "MULTI_TASK"
+}
