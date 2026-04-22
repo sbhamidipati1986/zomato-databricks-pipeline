@@ -1,0 +1,199 @@
+###############################################################################
+# Zomato Analytics — CD Pipeline
+# Triggers ONLY when a PR is merged into main.
+# Deploys .ipynb notebooks to Databricks workspace using REST API.
+# Includes pre-deploy validation, post-deployment smoke test, and
+# auto-revert on failure.
+###############################################################################
+
+name: CD — Deploy to Databricks
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  PYTHON_VERSION: "3.11"
+  WORKSPACE_PATH: "/Workspace/Zomato-Analytics"
+
+permissions:
+  contents: write
+  deployments: write
+  pull-requests: write
+
+jobs:
+  deploy:
+    name: Deploy to Databricks
+    runs-on: ubuntu-latest
+    if: >
+      (github.event_name == 'pull_request' && github.event.pull_request.merged == true) ||
+      github.event_name == 'workflow_dispatch'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install requests nbformat
+
+      - name: Validate .ipynb notebooks before deploy
+        run: |
+          echo "=== Pre-deploy: Validating .ipynb notebooks ==="
+          FAILED=0
+          for notebook in $(find notebooks -name "*.ipynb" -type f); do
+            echo "Checking: $notebook"
+            python3 -c "
+          import json, sys, nbformat
+          try:
+              with open('$notebook', 'r') as f:
+                  nb = nbformat.read(f, as_version=4)
+              for i, cell in enumerate(nb.cells):
+                  if cell.cell_type == 'code':
+                      clean = '\n'.join(
+                          l for l in cell.source.splitlines()
+                          if not l.strip().startswith('%') and not l.strip().startswith('!')
+                      )
+                      if clean.strip():
+                          compile(clean, '$notebook:cell-' + str(i), 'exec')
+              print('  ✓ OK')
+          except (json.JSONDecodeError, nbformat.ValidationError) as e:
+              print(f'  ✗ Format error: {e}')
+              sys.exit(1)
+          except SyntaxError as e:
+              print(f'  ✗ Syntax error in cell: {e}')
+              sys.exit(1)
+          " || FAILED=1
+          done
+          if [ $FAILED -eq 1 ]; then
+            echo "✗ Pre-deploy validation failed — aborting deployment"
+            exit 1
+          fi
+          echo "✓ All notebooks valid — proceeding with deployment"
+
+      - name: Deploy notebooks to Databricks
+        id: deploy
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          python3 scripts/deploy_notebooks.py \
+            --host "$DATABRICKS_HOST" \
+            --token "$DATABRICKS_TOKEN" \
+            --workspace-path "${{ env.WORKSPACE_PATH }}"
+
+      - name: Smoke test — verify all notebooks exist
+        id: smoke_test
+        if: steps.deploy.outcome == 'success'
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          python3 scripts/smoke_test.py \
+            --host "$DATABRICKS_HOST" \
+            --token "$DATABRICKS_TOKEN" \
+            --workspace-path "${{ env.WORKSPACE_PATH }}"
+
+      - name: Create/update Databricks Job
+        id: create_job
+        if: steps.smoke_test.outcome == 'success'
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          python3 scripts/create_databricks_job.py \
+            --host "$DATABRICKS_HOST" \
+            --token "$DATABRICKS_TOKEN" \
+            --workspace-path "${{ env.WORKSPACE_PATH }}" \
+            --alert-email "dataarchitectstudio@gmail.com"
+
+      - name: Deployment summary
+        if: steps.smoke_test.outcome == 'success'
+        run: |
+          echo "=============================================="
+          echo "  DEPLOYMENT SUMMARY"
+          echo "=============================================="
+          echo "  Trigger     : ${{ github.event_name }}"
+          echo "  PR          : #${{ github.event.pull_request.number || 'N/A' }}"
+          echo "  Merged by   : ${{ github.actor }}"
+          echo "  Commit      : ${{ github.sha }}"
+          echo "  Timestamp   : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo ""
+          echo "  Notebooks deployed to:"
+          echo "    ${{ env.WORKSPACE_PATH }}/setup/00_create_tables"
+          echo "    ${{ env.WORKSPACE_PATH }}/setup/01_generate_data"
+          echo "    ${{ env.WORKSPACE_PATH }}/bronze/01_bronze_ingestion"
+          echo "    ${{ env.WORKSPACE_PATH }}/silver/02_silver_transformation"
+          echo "    ${{ env.WORKSPACE_PATH }}/gold/03_gold_aggregation"
+          echo "    ${{ env.WORKSPACE_PATH }}/dashboard/04_analytics_dashboard"
+          echo "    ${{ env.WORKSPACE_PATH }}/orchestration/05_run_pipeline"
+          echo ""
+          echo "  Databricks Job: Created/Updated"
+          echo "=============================================="
+
+  # -------------------------------------------------------------------
+  # Auto-revert: if deploy or smoke test fails, revert the merge commit
+  # so main always stays in a deployable state.
+  # -------------------------------------------------------------------
+  auto-revert:
+    name: Auto-Revert on Failure
+    runs-on: ubuntu-latest
+    needs: [deploy]
+    if: failure() && github.event_name == 'pull_request'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 5
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Revert the merge commit
+        run: |
+          MERGE_SHA="${{ github.event.pull_request.merge_commit_sha }}"
+          echo "=============================================="
+          echo "  AUTO-REVERT: Deployment failed!"
+          echo "=============================================="
+          echo "  Reverting merge commit: $MERGE_SHA"
+          echo "  PR: #${{ github.event.pull_request.number }}"
+          echo ""
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git revert --no-edit -m 1 "$MERGE_SHA"
+          git push origin main
+
+          echo "  ✓ Merge commit reverted — main is restored"
+          echo "=============================================="
+
+      - name: Comment on PR about revert
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `## ⚠️ Auto-Reverted\n\nThe deployment to Databricks **failed** after this PR was merged. The merge commit has been automatically reverted to keep \`main\` in a deployable state.\n\n**What to do:**\n1. Check the [failed workflow run](${context.payload.pull_request.html_url}/checks) for error details\n2. Fix the issue on your branch\n3. Open a new PR\n\n---\n🤖 *Automated by CD pipeline*`
+            });
