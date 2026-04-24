@@ -91,6 +91,21 @@ def build_job_config(workspace_path, alert_email):
             "min_retry_interval_millis": 60000,
         },
         {
+                "task_key": "dq_checks",
+                "description": "Run data quality checks and quarantine bad records",
+                "depends_on": [{"task_key": "bronze_ingestion"}],
+                "notebook_task": {
+                    "notebook_path": f"{wp}/quality/07_dq_checks",
+                    "base_parameters": {
+                        "catalog_name": "zomato_analytics",
+                        "env": "dev",
+                        "dq_threshold_pct": 90.0
+                    },
+                },
+                "timeout_seconds": 1800,
+                "max_retries": 0,
+        },
+        {
             "task_key": "silver_transformation",
             "description": "Cleanse and transform Bronze data into Silver layer",
             "depends_on": [{"task_key": "bronze_ingestion"}],
