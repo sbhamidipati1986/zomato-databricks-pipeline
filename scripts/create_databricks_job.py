@@ -108,7 +108,7 @@ def build_job_config(workspace_path, alert_email):
         {
             "task_key": "silver_transformation",
             "description": "Cleanse and transform Bronze data into Silver layer",
-            "depends_on": [{"task_key": "bronze_ingestion"}],
+            "depends_on": [{"task_key": "dq_checks"}],
             "notebook_task": {
                 "notebook_path": f"{wp}/silver/02_silver_transformation",
                 "base_parameters": {"catalog_name": "zomato_analytics", "env": "dev"},
